@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# App config / state (user-specific)
+settings.json
+selected_list.txt
+
+# IDE
+.idea/
+.vscode/
+

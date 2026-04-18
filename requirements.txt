@@ -1,0 +1,8 @@
+pywin32
+Pillow
+pillow-heif
+piexif
+python-dateutil
+mutagen
+hachoir
+
