@@ -20,7 +20,7 @@ from src.file_updater import set_file_timestamps
 
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 FAILED_LIST_FILENAME = 'selected_list.txt'
-_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # project root
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAILED_LIST_PATH = os.path.join(_APP_DIR, FAILED_LIST_FILENAME)
 
 _SEQ_RE = re.compile(r'(\d+)')
@@ -109,26 +109,15 @@ def load_failed_list() -> list[str]:
         return []
 
 
-def process_folder(
+def _process_single_folder(
     folder: str,
     log_callback: Callable[[str], None],
-    progress_callback: Callable[[int, int], None] = None,
-    only_files: list[str] = None,
+    progress_callback: Callable[[int, int], None],
+    only_files: Optional[set],
+    global_counter: list,   # [current, total] mutable
 ) -> dict:
-    """
-    Process supported media files in the given folder.
-
-    Args:
-        folder:            Path to the folder to scan.
-        log_callback:      Function(message: str) called for each log line.
-        progress_callback: Optional Function(current: int, total: int).
-        only_files:        If given, process only these filenames (retry mode).
-    """
+    """Process one folder and return its summary. Used by process_folder."""
     summary = {'total': 0, 'updated': 0, 'skipped': 0, 'failed': 0}
-
-    if not os.path.isdir(folder):
-        log_callback(f'ERROR: Folder not found: {folder}')
-        return summary
 
     all_supported = sorted([
         f for f in os.listdir(folder)
@@ -137,20 +126,18 @@ def process_folder(
     ])
 
     if only_files is not None:
-        only_set = set(only_files)
-        all_files = [f for f in all_supported if f in only_set]
-        log_callback(f'Retry mode — {len(all_files)} file(s) from failed list in: {folder}')
+        all_files = [f for f in all_supported if f in only_files]
     else:
         all_files = all_supported
-        log_callback(f'Found {len(all_files)} supported file(s) in: {folder}')
+
+    if not all_files:
+        return summary, []
 
     summary['total'] = len(all_files)
-    log_callback('-' * 60)
 
-    # ── Pass 1: metadata / filename → filesystem (for every file) ────────
+    # ── Pass 1 ────────────────────────────────────────────────────────
     dates: dict[str, tuple[datetime, str]] = {}
     read_errors: dict[str, str] = {}
-
     shell_ns = make_shell_namespace(folder)
 
     for filename in all_files:
@@ -164,12 +151,11 @@ def process_folder(
         except Exception as e:
             read_errors[filename] = str(e)
 
-    # ── Pass 2: infer from neighbors — only for IMG_ files with no date ──
+    # ── Pass 2: neighbor inference for IMG_ files ─────────────────────
     inferred: dict[str, tuple[datetime, str]] = {}
-
-    # Use full file list for neighbor lookup even in retry mode
-    neighbor_pool = all_supported if only_files is not None else all_files
+    neighbor_pool = all_supported
     neighbor_dates: dict[str, tuple[datetime, str]] = {}
+
     if only_files is not None:
         shell_ns_pool = make_shell_namespace(folder)
         for filename in neighbor_pool:
@@ -190,23 +176,21 @@ def process_folder(
             continue
         if not filename.upper().startswith('IMG_'):
             continue
-        pool_list = neighbor_pool
-        pool_idx = pool_list.index(filename) if filename in pool_list else idx
-        neighbor = _find_nearest_neighbor_date(pool_idx, pool_list, neighbor_dates)
+        pool_idx = neighbor_pool.index(filename) if filename in neighbor_pool else idx
+        neighbor = _find_nearest_neighbor_date(pool_idx, neighbor_pool, neighbor_dates)
         if neighbor:
-            neighbor_dt, neighbor_source = neighbor
-            inferred[filename] = (neighbor_dt, f'neighbor:{neighbor_source}')
+            inferred[filename] = (neighbor[0], f'neighbor:{neighbor[1]}')
 
-    # ── Apply timestamps and log ─────────────────────────────────────────
+    # ── Apply ─────────────────────────────────────────────────────────
     failed_files: list[tuple[str, str]] = []
 
-    for idx, filename in enumerate(all_files, start=1):
+    for filename in all_files:
         filepath = os.path.join(folder, filename)
-
+        global_counter[0] += 1
         if progress_callback:
-            progress_callback(idx, summary['total'])
+            progress_callback(global_counter[0], global_counter[1])
 
-        log_callback(f'[{idx}/{summary["total"]}] {filename}')
+        log_callback(f'[{global_counter[0]}/{global_counter[1]}] {filename}')
 
         if filename in read_errors:
             log_callback(f'  ✗ Error reading metadata: {read_errors[filename]}')
@@ -215,22 +199,91 @@ def process_folder(
             continue
 
         result = dates.get(filename) or inferred.get(filename)
-
         if result is None:
             log_callback('  – No date found anywhere. Skipped.')
             summary['skipped'] += 1
             continue
 
         dt, source = result
-
         try:
             set_file_timestamps(filepath, dt)
-            log_callback(f'  ✓ Timestamps updated → {dt.strftime("%Y-%m-%d %H:%M:%S")}  [{source}]')
+            log_callback(f'  ✓ {dt.strftime("%Y-%m-%d %H:%M:%S")}  [{source}]')
             summary['updated'] += 1
         except Exception as e:
             log_callback(f'  ✗ Error updating timestamps: {e}')
             failed_files.append((filename, str(e)))
             summary['failed'] += 1
+
+    return summary, failed_files
+
+
+def process_folder(
+    folder: str,
+    log_callback: Callable[[str], None],
+    progress_callback: Callable[[int, int], None] = None,
+    only_files: list[str] = None,
+    recursive: bool = False,
+) -> dict:
+    """
+    Process supported media files in the given folder.
+
+    Args:
+        folder:            Path to the folder to scan.
+        log_callback:      Function(message: str) called for each log line.
+        progress_callback: Optional Function(current: int, total: int).
+        only_files:        If given, process only these filenames.
+        recursive:         If True, also process all subdirectories.
+    """
+    summary = {'total': 0, 'updated': 0, 'skipped': 0, 'failed': 0}
+
+    if not os.path.isdir(folder):
+        log_callback(f'ERROR: Folder not found: {folder}')
+        return summary
+
+    only_set = set(only_files) if only_files is not None else None
+
+    # Collect all folders to process
+    if recursive:
+        folders = []
+        for root, dirs, _ in os.walk(folder):
+            dirs.sort()
+            folders.append(root)
+    else:
+        folders = [folder]
+
+    # Count total files upfront for accurate progress
+    total_files = 0
+    for f in folders:
+        supported = [
+            x for x in os.listdir(f)
+            if os.path.isfile(os.path.join(f, x))
+            and os.path.splitext(x)[1].lower() in SUPPORTED_EXTENSIONS
+        ]
+        if only_set is not None:
+            supported = [x for x in supported if x in only_set]
+        total_files += len(supported)
+
+    mode = 'Selected files' if only_set is not None else 'All files'
+    sub_note = f', {len(folders)} folder(s)' if recursive else ''
+    log_callback(f'{mode} — {total_files} file(s) found{sub_note} in: {folder}')
+    log_callback('-' * 60)
+
+    global_counter = [0, total_files]
+    all_failed: list[tuple[str, str]] = []
+
+    for sub_folder in folders:
+        if recursive and sub_folder != folder:
+            rel = os.path.relpath(sub_folder, folder)
+            log_callback(f'📁 {rel}')
+
+        result = _process_single_folder(
+            sub_folder, log_callback, progress_callback, only_set, global_counter
+        )
+        if result:
+            sub_summary, failed_files = result
+            for key in summary:
+                summary[key] += sub_summary[key]
+            all_failed.extend(failed_files)
 
     log_callback('-' * 60)
     log_callback(
@@ -240,14 +293,14 @@ def process_folder(
         f'Total: {summary["total"]}'
     )
 
-    if failed_files:
+    if all_failed:
         log_callback('')
         log_callback('Files with errors:')
-        for fname, reason in failed_files:
+        for fname, reason in all_failed:
             log_callback(f'  ✗ {fname}: {reason}')
 
-    _save_failed_list(failed_files)
-    if failed_files:
+    _save_failed_list(all_failed)
+    if all_failed:
         log_callback(f'  → Error list saved to {FAILED_LIST_FILENAME}')
 
     return summary

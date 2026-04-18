@@ -12,6 +12,7 @@ import os
 import threading
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
+from datetime import datetime
 
 from src.processor import process_folder, load_failed_list
 
@@ -21,6 +22,9 @@ from src.processor import process_folder, load_failed_list
 
 DEFAULT_FOLDER   = r'c:\Documents\Photo\_NEW\iCloud Photos - test'
 SETTINGS_FILE    = os.path.join(os.path.dirname(__file__), '..', 'settings.json')
+
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOGS_DIR = os.path.join(_APP_DIR, 'logs')
 
 # Palette
 C_BG          = '#f5f6f8'   # window background
@@ -40,24 +44,34 @@ C_SEP         = '#94a3b8'   # separator / info
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _load_last_folder() -> str:
+def _load_settings() -> dict:
     try:
         with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            folder = data.get('last_folder', '')
-            if folder and os.path.isdir(folder):
-                return folder
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_settings(data: dict) -> None:
+    try:
+        existing = _load_settings()
+        existing.update(data)
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(existing, f, indent=2)
     except Exception:
         pass
+
+
+def _load_last_folder() -> str:
+    data = _load_settings()
+    folder = data.get('last_folder', '')
+    if folder and os.path.isdir(folder):
+        return folder
     return DEFAULT_FOLDER if os.path.isdir(DEFAULT_FOLDER) else ''
 
 
 def _save_last_folder(folder: str) -> None:
-    try:
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'last_folder': folder}, f, indent=2)
-    except Exception:
-        pass
+    _save_settings({'last_folder': folder})
 
 
 # ---------------------------------------------------------------------------
@@ -187,17 +201,33 @@ class App(tk.Tk):
         )
         clear_btn.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.only_selected_var = tk.BooleanVar(value=True)
+        settings = _load_settings()
+
+        self.only_selected_var = tk.BooleanVar(value=settings.get('only_selected', True))
         only_selected_cb = tk.Checkbutton(
-            bottom, text='Run only for selected files',
+            bottom, text='Selected files only',
             variable=self.only_selected_var,
+            command=lambda: _save_settings({'only_selected': self.only_selected_var.get()}),
             bg=C_BG, fg=C_TEXT_MUTED,
             activebackground=C_BG, activeforeground=C_TEXT,
             selectcolor=C_BG,
             font=('Segoe UI', 9),
             relief='flat', bd=0, cursor='hand2',
         )
-        only_selected_cb.pack(side=tk.LEFT, padx=(0, 10))
+        only_selected_cb.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.recursive_var = tk.BooleanVar(value=settings.get('recursive', False))
+        recursive_cb = tk.Checkbutton(
+            bottom, text='Include subdirectories',
+            variable=self.recursive_var,
+            command=lambda: _save_settings({'recursive': self.recursive_var.get()}),
+            bg=C_BG, fg=C_TEXT_MUTED,
+            activebackground=C_BG, activeforeground=C_TEXT,
+            selectcolor=C_BG,
+            font=('Segoe UI', 9),
+            relief='flat', bd=0, cursor='hand2',
+        )
+        recursive_cb.pack(side=tk.LEFT, padx=(0, 10))
 
         self.start_btn = tk.Button(
             bottom, text='▶   Start',
@@ -288,19 +318,41 @@ class App(tk.Tk):
                 self.start_btn.configure(state=tk.NORMAL)
                 return
 
-        thread = threading.Thread(target=self._run_processing, args=(folder,), kwargs={'only_files': only_files}, daemon=True)
+        recursive = self.recursive_var.get()
+
+        thread = threading.Thread(
+            target=self._run_processing,
+            args=(folder,),
+            kwargs={'only_files': only_files, 'recursive': recursive},
+            daemon=True,
+        )
         thread.start()
 
-    def _run_processing(self, folder: str, only_files=None):
+    def _run_processing(self, folder: str, only_files=None, recursive=False):
+        log_lines = []
+
         def log(msg: str):
+            log_lines.append(msg)
             self.after(0, self._log, msg)
 
         def progress(current: int, total: int):
             pct = int(current / total * 100) if total else 0
             self.after(0, self._set_progress, pct)
 
-        process_folder(folder, log_callback=log, progress_callback=progress, only_files=only_files)
+        process_folder(folder, log_callback=log, progress_callback=progress,
+                       only_files=only_files, recursive=recursive)
+        self._save_log(log_lines)
         self.after(0, self._on_done)
+
+    def _save_log(self, lines: list[str]):
+        try:
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            log_path = os.path.join(LOGS_DIR, f'run_{timestamp}.log')
+            with open(log_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(lines))
+        except Exception:
+            pass
 
     def _on_done(self):
         self.start_btn.configure(state=tk.NORMAL)

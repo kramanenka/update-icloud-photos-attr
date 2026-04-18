@@ -15,10 +15,11 @@ import re
 import piexif
 from datetime import datetime
 from typing import Optional
+from src.filename_patterns import FILENAME_DATE_PATTERNS
 
 # Supported extensions and their processing category
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.heic', '.tiff', '.tif', '.png', '.bmp'}
-VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.3gp'}
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.3gp', '.ogg'}
 
 # Shell property indices
 SHELL_PROP_DATE_TAKEN = 12
@@ -29,16 +30,13 @@ _UNICODE_JUNK = re.compile(r'[\u200e\u200f\u202a-\u202e\u2066-\u2069\u200b\u00a0
 
 
 def _clean_shell_date(raw: str) -> str:
-    """Remove Unicode formatting marks injected by Windows Shell."""
     return _UNICODE_JUNK.sub('', raw).strip()
 
 
 def _parse_shell_date(raw: str) -> Optional[datetime]:
-    """Parse a Windows Shell date string into a datetime object."""
     cleaned = _clean_shell_date(raw)
     if not cleaned:
         return None
-
     formats = [
         '%m/%d/%Y %I:%M %p',
         '%m/%d/%Y %H:%M',
@@ -52,8 +50,6 @@ def _parse_shell_date(raw: str) -> Optional[datetime]:
             return datetime.strptime(cleaned, fmt)
         except ValueError:
             continue
-
-    # Last resort: dateutil
     try:
         from dateutil import parser as du_parser
         return du_parser.parse(cleaned)
@@ -62,7 +58,6 @@ def _parse_shell_date(raw: str) -> Optional[datetime]:
 
 
 def _get_shell_property(filename: str, prop_index: int, ns) -> Optional[str]:
-    """Retrieve a shell namespace property value for a file using a pre-built namespace."""
     try:
         if ns is None:
             return None
@@ -80,18 +75,39 @@ def make_shell_namespace(folder: str):
     try:
         import win32com.client
         sh = win32com.client.Dispatch('Shell.Application')
-        return sh.Namespace(folder)
+        return sh.Namespace(os.path.normpath(folder))
     except Exception:
         return None
 
 
 def _read_exif_date(filepath: str) -> Optional[datetime]:
-    """Extract DateTimeOriginal from EXIF data using piexif."""
+    """Extract DateTimeOriginal from EXIF. Supports JPEG/TIFF via piexif, HEIC via pillow-heif."""
+    ext = os.path.splitext(filepath)[1].lower()
+
+    if ext == '.heic':
+        try:
+            import pillow_heif
+            from PIL import Image
+            pillow_heif.register_heif_opener()
+            img = Image.open(filepath)
+            exif_data = img.getexif()
+            if exif_data:
+                for tag_id in (36867, 306):   # DateTimeOriginal, DateTime
+                    val = exif_data.get(tag_id)
+                    if val:
+                        try:
+                            return datetime.strptime(val, '%Y:%m:%d %H:%M:%S')
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+        return None
+
     try:
         exif_data = piexif.load(filepath)
-        for ifd in ('Exif', '0th'):
+        for ifd, tag in (('Exif', piexif.ExifIFD.DateTimeOriginal),
+                         ('0th',  piexif.ImageIFD.DateTime)):
             if ifd in exif_data:
-                tag = piexif.ExifIFD.DateTimeOriginal if ifd == 'Exif' else piexif.ImageIFD.DateTime
                 raw = exif_data[ifd].get(tag)
                 if raw:
                     dt_str = raw.decode('utf-8') if isinstance(raw, bytes) else raw
@@ -104,47 +120,14 @@ def _read_exif_date(filepath: str) -> Optional[datetime]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Filename-based date patterns (last resort)
-# Each tuple: (regex, strptime_format)
-# Patterns ordered from most to least specific (datetime → date-only)
-# ---------------------------------------------------------------------------
-_FILENAME_DATE_PATTERNS = [
-    # Telegram: photo_2025-03-06 23.52.23  or  photo_2025-03-06_23.52.23
-    (re.compile(r'(\d{4}-\d{2}-\d{2})[ _](\d{2})\.(\d{2})\.(\d{2})'), '%Y-%m-%d %H:%M:%S',
-     lambda m: f'{m.group(1)} {m.group(2)}:{m.group(3)}:{m.group(4)}'),
-
-    # Android / WhatsApp: IMG_20250306_235223  VID_20250306_235223  WA20250306-235223
-    (re.compile(r'(?:IMG|VID|WA|PANO|BURST|MVIMG)[-_]?(\d{8})[-_](\d{6})'),
-     '%Y%m%d %H%M%S',
-     lambda m: f'{m.group(1)} {m.group(2)}'),
-
-    # Screenshot_2025-03-06-23-52-23  or  Screenshot_20250306-235223
-    (re.compile(r'[Ss]creenshot[_-](\d{4}-\d{2}-\d{2})-(\d{2}-\d{2}-\d{2})'),
-     '%Y-%m-%d %H-%M-%S',
-     lambda m: f'{m.group(1)} {m.group(2)}'),
-
-    # Generic ISO datetime in name: 2025-03-06_23-52-23  or  2025-03-06T23:52:23
-    (re.compile(r'(\d{4}-\d{2}-\d{2})[T_ ](\d{2})[:\-](\d{2})[:\-](\d{2})'),
-     '%Y-%m-%d %H:%M:%S',
-     lambda m: f'{m.group(1)} {m.group(2)}:{m.group(3)}:{m.group(4)}'),
-
-    # Date only (least specific — use only if nothing else matches):
-    # 2025-03-06  or  20250306
-    (re.compile(r'(\d{4}-\d{2}-\d{2})'), '%Y-%m-%d', lambda m: m.group(1)),
-    (re.compile(r'(\d{4})(\d{2})(\d{2})(?!\d)'), '%Y%m%d',
-     lambda m: f'{m.group(1)}{m.group(2)}{m.group(3)}'),
-]
-
-
 def _date_from_filename(filename: str) -> Optional[datetime]:
-    """Try to extract a datetime from common date/time patterns in a filename."""
+    """Try to extract a datetime from filename using patterns in filename_patterns.py."""
     stem = os.path.splitext(filename)[0]
-    for pattern, fmt, builder in _FILENAME_DATE_PATTERNS:
-        m = pattern.search(stem)
+    for entry in FILENAME_DATE_PATTERNS:
+        m = entry['regex'].search(stem)
         if m:
             try:
-                return datetime.strptime(builder(m), fmt)
+                return datetime.strptime(entry['builder'](m), entry['fmt'])
             except ValueError:
                 continue
     return None
@@ -154,18 +137,13 @@ def get_original_date(filepath: str, shell_ns=None) -> Optional[tuple[datetime, 
     """
     Attempt to extract the original media creation date from a file.
 
-    Returns a (datetime, source) tuple if found, or None if no date can be determined.
-    Source is one of: 'EXIF', 'Shell:DateTaken', 'Shell:MediaCreated', 'filename'
-
-    Args:
-        filepath:  Absolute path to the file.
-        shell_ns:  Pre-built Shell namespace for the file's folder (from make_shell_namespace).
-                   If None, shell properties are skipped.
+    Returns a (datetime, source) tuple or None.
+    Source is one of: 'EXIF', 'Shell:DateTaken', 'Shell:MediaCreated', 'filename:<pattern>'
     """
     ext = os.path.splitext(filepath)[1].lower()
     filename = os.path.basename(filepath)
 
-    # --- Images: try EXIF first ---
+    # --- Images: EXIF first, then Shell ---
     if ext in IMAGE_EXTENSIONS:
         dt = _read_exif_date(filepath)
         if dt:
@@ -176,7 +154,7 @@ def get_original_date(filepath: str, shell_ns=None) -> Optional[tuple[datetime, 
             if dt:
                 return dt, 'Shell:DateTaken'
 
-    # --- Videos: use Shell "Media created" property ---
+    # --- Videos/audio: Shell "Media created" ---
     if ext in VIDEO_EXTENSIONS:
         raw = _get_shell_property(filename, SHELL_PROP_MEDIA_CREATED, shell_ns)
         if raw:
@@ -184,10 +162,15 @@ def get_original_date(filepath: str, shell_ns=None) -> Optional[tuple[datetime, 
             if dt:
                 return dt, 'Shell:MediaCreated'
 
-    # --- Last resort for all types: parse date from filename ---
-    dt = _date_from_filename(filename)
-    if dt:
-        return dt, 'filename'
+    # --- Last resort: filename pattern ---
+    stem = os.path.splitext(filename)[0]
+    for entry in FILENAME_DATE_PATTERNS:
+        m = entry['regex'].search(stem)
+        if m:
+            try:
+                dt = datetime.strptime(entry['builder'](m), entry['fmt'])
+                return dt, f'filename:{entry["name"]}'
+            except ValueError:
+                continue
 
     return None
-

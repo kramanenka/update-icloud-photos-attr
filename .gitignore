@@ -8,8 +8,11 @@ venv/
 
 # App config / state (user-specific)
 settings.json
+selected_list.txt
+
+# Logs
+logs/
 
 # IDE
 .idea/
 .vscode/
-
