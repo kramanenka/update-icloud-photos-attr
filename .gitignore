@@ -8,7 +8,6 @@ venv/
 
 # App config / state (user-specific)
 settings.json
-selected_list.txt
 
 # IDE
 .idea/

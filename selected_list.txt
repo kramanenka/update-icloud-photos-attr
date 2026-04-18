@@ -1,0 +1,3 @@
+# Files that failed during the last run. Edit freely — one filename per line.
+camphoto_1791740531.jpg
+camphoto_959030623.jpg
